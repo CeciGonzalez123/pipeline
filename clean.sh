@@ -11,7 +11,7 @@ fi
 # Establecer archivo de salida (corpus por defecto)
 ARCHIVO_SALIDA=${2:-"corpus"}
 
-# Ruta al script de limpieza (ajusta según tu estructura)
+# Ruta al script de limpieza (ajustar según lu estructura)
 SCRIPT_LIMPIEZA="methods/clean/clean.py"
 
 # Ejecutar el proceso de limpieza
