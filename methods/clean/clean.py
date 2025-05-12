@@ -25,7 +25,143 @@ import os
 import sys
 from pathlib import Path
 from typing import Tuple, List, Pattern
+import argparse
+from pathlib import Path
+import fasttext
+import numpy as np
+import nltk
+from huggingface_hub import hf_hub_download
+from nltk import sent_tokenize
 
+# Configuración esencial para NLTK
+#nltk.download('punkt', quiet=True)
+
+class ValidatorGuarani:
+    def __init__(self, threshold: float = 0.8):
+        self.threshold = threshold
+        self.ft_model = fasttext.load_model('lid.176.bin')
+        self.glotlid_model = self._load_glotlid()
+        
+    def _load_glotlid(self):
+        model_path = hf_hub_download(
+            repo_id="cis-lmu/glotlid",
+            filename="model.bin"
+        )
+        return fasttext.load_model(model_path)
+
+    def _is_guarani(self, text: str) -> bool:
+        """Determina si un texto es guaraní con ambos modelos"""
+        ft_label, _ = self.ft_model.predict(text, k=1)
+        glot_label, _ = self.glotlid_model.predict(text, k=1)
+        
+        ft_gn = '__label__gn' in ft_label[0]
+        glot_gn = any(x in glot_label[0] for x in [
+            '__label__grn_Latn', '__label__gug_Latn', '__label__gn'
+        ])
+        
+        return ft_gn and glot_gn
+
+    def validate_content(self, content: str) -> Tuple[bool, float]:
+        """Valida contenido de texto en lugar de archivo"""
+        try:
+            content = content.replace('\n', ' ')
+            sentences = nltk.sent_tokenize(content, language='spanish')
+            
+            if not sentences:
+                return (False, 0.0, content)
+            
+            valid_count = 0
+            for sentence in sentences:
+                clean_sentence = sentence.strip()
+                if len(clean_sentence) >= 5 and self._is_guarani(clean_sentence):
+                    valid_count += 1
+                    
+            percentage = valid_count / len(sentences)
+            return (percentage >= self.threshold, percentage, content)
+            
+        except Exception as e:
+            print(f"  ✗ Error validación: {str(e)}")
+            return (False, 0.0, content)
+        
+
+class ValidadorCalidad:
+    def __init__(self, threshold: float = 0.7):
+        self.threshold = threshold  # Umbral global de calidad (0-1)
+        
+        # Configuración de parámetros ajustables
+        self.config = {
+            'max_upper_ratio': 0.2,
+            'min_words': 3,
+            'max_words': 50,
+            'repetition_window': 5,
+            'max_repetitions': 2,
+            'allowed_chars': r'[a-zA-ZãẽĩõũáéíóúýñçÁÉÍÓÚÝÑÇ\'\- \t\n.,!?;:¿¡%&$#@()]'
+        }
+    
+    def validate_document(self, text: str) -> Tuple[bool, float]:
+        """Evalúa el texto y devuelve si cumple con el umbral de calidad"""
+        scores = []
+        
+        # 1. Capitalización consistente (20% peso)
+        cap_score = self._check_capitalization(text)
+        scores.append(cap_score * 0.2)
+        
+        # 2. Longitud de oraciones (30% peso)
+        len_score = self._check_sentence_lengths(text)
+        scores.append(len_score * 0.3)
+        
+        # 3. Repeticiones (25% peso)
+        rep_score = self._check_repetitions(text)
+        scores.append(rep_score * 0.25)
+        
+        # 4. Caracteres válidos (25% peso)
+        char_score = self._check_suspicious_chars(text)
+        scores.append(char_score * 0.25)
+        
+        total_score = sum(scores)
+        return (total_score >= self.threshold, total_score)
+
+    def _check_capitalization(self, text: str) -> float:
+        letras = [c for c in text if c.isalpha()]
+        if not letras:
+            return 1.0  # Texto sin letras no se penaliza
+            
+        mayusculas = sum(1 for c in letras if c.isupper())
+        oraciones = re.split(r'[.!?…]', text)
+        validas = sum(1 for o in oraciones if o.strip() and o.strip()[0].isupper())
+        
+        ratio_invalidas = max(0, (mayusculas - validas) / len(letras))
+        return 1.0 - min(ratio_invalidas / self.config['max_upper_ratio'], 1.0)
+
+    def _check_sentence_lengths(self, text: str) -> float:
+        oraciones = re.split(r'[.!?…]', text)
+        if not oraciones:
+            return 0.0
+            
+        validas = 0
+        for o in oraciones:
+            palabras = o.strip().split()
+            if self.config['min_words'] <= len(palabras) <= self.config['max_words']:
+                validas += 1
+        return validas / len(oraciones)
+
+    def _check_repetitions(self, text: str) -> float:
+        palabras = text.split()
+        repeticiones = 0
+        
+        for i in range(len(palabras) - self.config['repetition_window'] + 1):
+            ventana = palabras[i:i+self.config['repetition_window']]
+            if len(set(ventana)) == 1:
+                repeticiones += 1
+                
+        return 1.0 if repeticiones <= self.config['max_repetitions'] else 0.0
+
+    def _check_suspicious_chars(self, text: str) -> float:
+        caracteres_invalidos = re.findall(
+            f'[^{self.config["allowed_chars"]}]', 
+            text
+        )
+        return 1.0 - (len(caracteres_invalidos) / len(text)) if text else 1.0
 
 class Limpiador:
     """Clase principal para el procesamiento y limpieza de corpus en guaraní.
@@ -135,15 +271,13 @@ class Limpiador:
         texto = re.sub(r'\s+', ' ', texto).strip()
         
         reemplazos = [
-            (r'[g̃G̃]', 'ĝ'),
-            (r'[ãÃ]', 'ã'),
-            (r'[ẽẼ]', 'ẽ'),
-            (r'[ĩĨ]', 'ĩ'),
-            (r'[õÕ]', 'õ'),
-            (r'[ũŨ]', 'ũ'),
-            (r'[ýÝ]', 'ý'),
-            (r'[´`]', "'"),
-            (r'[“”]', '"'),
+            (r'ñ', 'ñ'),  # Mantener ñ original
+            (r'Ã¡', 'á'), (r'Ã©', 'é'), (r'Ã­', 'í'),
+            (r'Ã³', 'ó'), (r'Ãº', 'ú'),  # Corregir caracteres latin-1
+            (r'ã', 'ã'), (r'ẽ', 'ẽ'), (r'ĩ', 'ĩ'),
+            (r'õ', 'õ'), (r'ũ', 'ũ'),  # Mantener caracteres guaraníes
+            (r'ĝ', 'g̃'),  # Usar la combinación unicode correcta
+            (r'[“”]', '"'), (r'[‘’]', "'")
         ]
         
         for patron, reemplazo in reemplazos:
@@ -166,7 +300,8 @@ class Limpiador:
     def procesar_archivo(
         self, 
         ruta_entrada: str, 
-        directorio_salida: str
+        directorio_salida: str,
+        tolerancia: float
     ) -> None:
         """Procesa un archivo completo y guarda el resultado.
 
@@ -191,32 +326,85 @@ class Limpiador:
         se_conserva, contenido_limpio = self.limpiar_documento(contenido)
         
         if se_conserva:
-            os.makedirs(directorio_salida, exist_ok=True)
-            nombre_archivo = Path(ruta_entrada).stem
-            ruta_salida = os.path.join(
-                directorio_salida, 
-                f"{nombre_archivo}_limpio.txt"
-            )
+
+            validador = ValidatorGuarani(tolerancia)
+            # Validar contenido        
+            es_valido, porcentaje, _ = validador.validate_content(contenido_limpio)
+
+            if es_valido:
+                print(f"  ✓ Válido ({porcentaje:.0%} guaraní)")
+
+
+                quality = ValidadorCalidad()          
+                calidad_ok, calidad_score = quality.validate_document(contenido_limpio)
+                print(f"  ✓ Calidad: {calidad_score:.0%}")
+                
+                if not calidad_ok:
+                    print(f"  ✗ Calidad insuficiente ({calidad_score:.0%} < {porcentaje})")
+                    return
+
+                os.makedirs(directorio_salida, exist_ok=True)
+                nombre_archivo = Path(ruta_entrada).stem
+                ruta_salida = os.path.join(
+                    directorio_salida, 
+                    f"{nombre_archivo}.txt"
+                )
             
-            with open(ruta_salida, 'w', encoding='utf-8') as f:
-                f.write(contenido_limpio)
-            print(f"Procesado exitoso: {ruta_salida}")
+                with open(ruta_salida, 'w', encoding='utf-8') as f:
+                    success = f.write(contenido_limpio)
+                
+                    if success:
+                        print(f"  ✓ Procesado → {ruta_salida}")
+                    else:
+                        print("  ✗ Error en procesamiento posterior")
+            else:
+                print(f"  ✗ Inválido ({porcentaje:.0%} guaraní)")
+
         else:
             print(f"Documento no cumple los criterios: {ruta_entrada}")
 
 
 def main() -> None:
-    """Función principal para ejecución desde línea de comandos.
-    
-    Uso esperado:
-        python3 clean.py archivo_entrada.txt directorio_salida/
+    """Función principal para procesamiento de archivos
     """
-    if len(sys.argv) != 3:
-        print("Uso: python3 clean.py archivo_entrada.txt directorio_salida/")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description='Procesamiento de corpus en guaraní'
+    )
+
+    parser.add_argument('-i', '--input', required=True, 
+                      help='Directorio de entrada con archivos .txt')
+    parser.add_argument('-o', '--output_dir', default='corpus/', 
+                      help='Directorio de salida')
+    parser.add_argument('--threshold', type=float, default=0.8,
+                    help='%% mínimo de oraciones en guaraní (0-1)') 
+    
+    args = parser.parse_args()
+
+    print(args.threshold)
+    
+    # Validar directorio de entrada
+    input_dir = Path(args.input)
+    if not input_dir.is_dir():
+        print(f"✗ Error: '{args.input}' no es un directorio válido")
+        exit(1)
+    
+    # Crear directorio de salida si no existe
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Procesar archivos .txt
+    txt_files = list(input_dir.glob("*.txt"))
+    if not txt_files:
+        print(f"✗ No se encontraron archivos .txt en {input_dir}")
+        exit(1)
         
     limpiador = Limpiador()
-    limpiador.procesar_archivo(sys.argv[1], sys.argv[2])
+
+    print(f"\nProcesando {len(txt_files)} archivos en {input_dir}...")
+    
+    for txt_file in txt_files:
+        print(f"\n• Archivo: {txt_file.name}")       
+        limpiador.procesar_archivo(str(txt_file), args.output_dir, args.threshold)
 
 
 if __name__ == "__main__":

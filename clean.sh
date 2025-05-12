@@ -1,10 +1,10 @@
 #!/bin/bash
-# clean.sh - Procesa un archivo de texto con clean.py
+# clean.sh - Procesa archivos .txt de la carpeta indicada con methods/clean.py
 
-# Verificar que se proporcionó un archivo de entrada
+# Verificar que se proporcionó una carpeta de entrada
 if [ -z "$1" ]; then
-    echo "Error: Debes especificar la ruta del archivo a limpiar"
-    echo "Uso: $0 <archivo_entrada> [archivo_salida]"
+    echo "Error: Debes especificar la ruta de la carpeta a procesar"
+    echo "Uso: $0 <directorio_entrada> [dirctorio_salida]"
     exit 1
 fi
 
@@ -16,4 +16,4 @@ SCRIPT_LIMPIEZA="methods/clean/clean.py"
 
 # Ejecutar el proceso de limpieza
 echo "Procesando $1 -> $ARCHIVO_SALIDA"
-python3 "$SCRIPT_LIMPIEZA" "$1" "$ARCHIVO_SALIDA"
+python3 "$SCRIPT_LIMPIEZA" -i "$1" -o "$ARCHIVO_SALIDA" $3
