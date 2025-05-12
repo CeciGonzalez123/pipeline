@@ -29,6 +29,8 @@ Uso
 Instalar dependencias:
 
 pip install -r requirements.txt
+https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
+python3 -m nltk.downloader all
 
 En la raiz del proyecto:
 - Dar permiso de ejecucion al archivo clean.sh
