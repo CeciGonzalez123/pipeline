@@ -19,7 +19,8 @@ Características principales:
 - Total adherencia a PEP 8 y documentación completa
 
 """
-
+from datasketch import MinHashLSH, MinHash
+import json
 import re
 import os
 import sys
@@ -31,10 +32,10 @@ import fasttext
 import numpy as np
 import nltk
 from huggingface_hub import hf_hub_download
-from nltk import sent_tokenize
+import hashlib
 
 # Configuración esencial para NLTK
-#nltk.download('punkt', quiet=True)
+nltk.download('punkt', quiet=True)
 
 class ValidatorGuarani:
     def __init__(self, threshold: float = 0.8):
@@ -185,7 +186,7 @@ class Limpiador:
         r"política de privacidad"
     ]
 
-    def __init__(self, oraciones_min: int = 3, palabras_min: int = 2) -> None:
+    def __init__(self, oraciones_min: int = 3, palabras_min: int = 2, fuzzy_threshold=0.8) -> None:
         """Inicializa el limpiador con parámetros configurables.
 
         Args:
@@ -204,6 +205,9 @@ class Limpiador:
         self.patron_division_oraciones = re.compile(
             r'([.!?…]|Héẽ|Maitei)\s+'
         )
+
+        self.fuzzy_dedup = FuzzyDeduplicator(threshold=fuzzy_threshold)
+        self.metadata = {}
 
     def es_relevante(self, texto: str) -> bool:
         """Determina si un texto cumple los criterios básicos de calidad.
@@ -301,7 +305,8 @@ class Limpiador:
         self, 
         ruta_entrada: str, 
         directorio_salida: str,
-        tolerancia: float
+        tolerancia: float,
+        existing_hashes: set = None
     ) -> None:
         """Procesa un archivo completo y guarda el resultado.
 
@@ -312,6 +317,10 @@ class Limpiador:
         Raises:
             IOError: Si hay problemas al leer/escribir archivos
         """
+
+        if existing_hashes is None:
+            existing_hashes = set()
+
         try:
             with open(ruta_entrada, 'r', encoding='utf-8') as f:
                 contenido = f.read()
@@ -342,6 +351,30 @@ class Limpiador:
                 if not calidad_ok:
                     print(f"  ✗ Calidad insuficiente ({calidad_score:.0%} < {porcentaje})")
                     return
+                
+                # Verificación de duplicados
+                contenido_bytes = contenido_limpio.encode('utf-8')
+                file_hash = hashlib.md5(contenido_bytes).hexdigest()
+                if file_hash in existing_hashes:
+                    print(f"  ✗ Duplicado exacto detectado, omitiendo")
+                    return
+                existing_hashes.add(file_hash)
+
+                # Deduplicación difusa
+                doc_id = Path(ruta_entrada).stem
+                cluster_id, is_new = self.fuzzy_dedup.process_document(doc_id, contenido_limpio)
+                
+                if not is_new:
+                    print(f"  ✗ Duplicado aproximado detectado (Cluster {cluster_id}, Tamaño: {self.fuzzy_dedup.clusters[cluster_id]['size']})")
+                    return
+
+                # Guardar metadata
+                self.metadata[doc_id] = {
+                    'cluster_id': cluster_id,
+                    'cluster_size': self.fuzzy_dedup.clusters[cluster_id]['size'],
+                    'original_path': ruta_entrada,
+                    'hash_md5': file_hash
+                }
 
                 os.makedirs(directorio_salida, exist_ok=True)
                 nombre_archivo = Path(ruta_entrada).stem
@@ -357,12 +390,106 @@ class Limpiador:
                         print(f"  ✓ Procesado → {ruta_salida}")
                     else:
                         print("  ✗ Error en procesamiento posterior")
+
+                metadata_path = os.path.join(directorio_salida, f"{nombre_archivo}.meta.json")
+                with open(metadata_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.metadata[doc_id], f)
+
             else:
                 print(f"  ✗ Inválido ({porcentaje:.0%} guaraní)")
 
         else:
             print(f"Documento no cumple los criterios: {ruta_entrada}")
 
+class FuzzyDeduplicator:
+    """Clase para detección de documentos similares usando técnicas de hashing aproximado.
+    
+    Implementa un sistema de deduplicación difusa utilizando:
+    - MinHash: Para crear huellas digitales compactas de documentos
+    - LSH (Local Sensitive Hashing): Para agrupar eficientemente documentos similares
+
+    Atributos:
+        threshold (float): Umbral de similitud para considerar documentos como duplicados (0.0-1.0)
+        num_perm (int): Número de permutaciones para MinHash (precisión/rendimiento)
+        lsh (MinHashLSH): Índice para búsqueda aproximada de vecinos cercanos
+        clusters (dict): Diccionario con la metadata de los grupos de documentos similares
+        next_cluster_id (int): Contador para ID de nuevos clusters
+
+    Ejemplo de uso:
+        >>> dedup = FuzzyDeduplicator(threshold=0.8)
+        >>> cluster_id, es_nuevo = dedup.process_document("doc1", texto_largo)
+    """
+
+    def __init__(self, threshold=0.8, num_perm=128):
+        """Inicializa el deduplicador difuso.
+        
+        Args:
+            threshold (float, opcional): Similitud mínima para agrupar documentos. Default=0.8
+            num_perm (int, opcional): Número de funciones hash para MinHash. Default=128
+        """
+        self.threshold = threshold
+        self.num_perm = num_perm
+        self.lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+        self.clusters = {}  # {doc_id: (minhash, metadata)}
+        self.next_cluster_id = 1
+
+    def _create_minhash(self, text):
+        """Crea la firma MinHash para un documento de texto.
+        
+        Args:
+            text (str): Contenido textual del documento
+            
+        Returns:
+            MinHash: Firma digital del documento
+            
+        Nota:
+            - Divide el texto en tokens por espacios
+            - Usa codificación UTF-8 para los hashes
+        """
+        tokens = text.split()
+        m = MinHash(num_perm=self.num_perm)
+        for token in tokens:
+            m.update(token.encode('utf-8'))
+        return m
+
+    def process_document(self, doc_id, text):
+        """Procesa un documento para detectar duplicados aproximados.
+        
+        Args:
+            doc_id (str): Identificador único del documento
+            text (str): Contenido textual a procesar
+            
+        Returns:
+            Tuple(str, bool): (ID del cluster, Es nuevo)
+            
+        Flujo de trabajo:
+            1. Genera el MinHash del documento
+            2. Consulta en el índice LSH
+            3. Si existe match:
+                - Incrementa el contador del cluster existente
+                - Retorna (cluster_id, False)
+            4. Si no existe match:
+                - Crea nuevo cluster
+                - Almacena metadata
+                - Retorna (cluster_id, True)
+        """
+        minhash = self._create_minhash(text)
+        results = self.lsh.query(minhash)
+        
+        if results:
+            cluster_id = results[0]
+            self.clusters[cluster_id]['size'] += 1
+            return cluster_id, False  # (cluster_id, is_new)
+        else:
+            cluster_id = f"cluster_{self.next_cluster_id}"
+            self.lsh.insert(cluster_id, minhash)
+            self.clusters[cluster_id] = {
+                'minhash': minhash,
+                'size': 1,
+                'representative': doc_id
+            }
+            self.next_cluster_id += 1
+            return cluster_id, True
 
 def main() -> None:
     """Función principal para procesamiento de archivos
@@ -391,6 +518,17 @@ def main() -> None:
     # Crear directorio de salida si no existe
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cargar hashes existentes para deduplicación
+    existing_hashes = set()
+    for existing_file in output_dir.glob("*.txt"):
+        try:
+            with open(existing_file, "r", encoding="utf-8") as f:
+                contenido = f.read()
+                file_hash = hashlib.md5(contenido.encode("utf-8")).hexdigest()
+                existing_hashes.add(file_hash)
+        except Exception as e:
+            print(f"  ✗ Error al leer archivo existente: {existing_file} - {str(e)}")
     
     # Procesar archivos .txt
     txt_files = list(input_dir.glob("*.txt"))
@@ -404,7 +542,22 @@ def main() -> None:
     
     for txt_file in txt_files:
         print(f"\n• Archivo: {txt_file.name}")       
-        limpiador.procesar_archivo(str(txt_file), args.output_dir, args.threshold)
+        limpiador.procesar_archivo(str(txt_file), args.output_dir, args.threshold, existing_hashes)
+
+    print("\n=== Archivos de Metadatos Generados ===")
+    meta_files = list(output_dir.glob("*.meta.json"))
+    
+    if not meta_files:
+        print("No se generaron archivos de metadatos")
+    else:
+        for meta_file in meta_files:
+            print(f"\n• Metadata: {meta_file.name}")
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                try:
+                    contenido = json.load(f)
+                    print(json.dumps(contenido, indent=2, ensure_ascii=False))
+                except Exception as e:
+                    print(f"  ✗ Error leyendo metadata: {str(e)}")
 
 
 if __name__ == "__main__":
